@@ -12,10 +12,21 @@ from . import sampling, utils
 class Denoiser(nn.Module):
     """A Karras et al. preconditioner for denoising diffusion models."""
 
-    def __init__(self, inner_model, sigma_data=1.):
+    def __init__(self, inner_model, sigma_data=1., weighting='karras'):
         super().__init__()
         self.inner_model = inner_model
         self.sigma_data = sigma_data
+        if callable(weighting):
+            self.weighting = weighting
+        if weighting == 'karras':
+            self.weighting = torch.ones_like
+        elif weighting == 'soft-min-snr':
+            self.weighting = self._weighting_soft_min_snr
+        else:
+            raise ValueError(f'Unknown weighting type {weighting}')
+
+    def _weighting_soft_min_snr(self, sigma):
+        return (sigma * self.sigma_data) ** 2 / (sigma ** 2 + self.sigma_data ** 2) ** 2
 
     def get_scalings(self, sigma):
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
@@ -25,10 +36,11 @@ class Denoiser(nn.Module):
 
     def loss(self, input, noise, sigma, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+        c_weight = self.weighting(sigma)
         noised_input = input + noise * utils.append_dims(sigma, input.ndim)
         model_output = self.inner_model(noised_input * c_in, sigma, **kwargs)
         target = (input - c_skip * noised_input) / c_out
-        return (model_output - target).pow(2).flatten(1).mean(1)
+        return (model_output - target).pow(2).flatten(1).mean(1) * c_weight
 
     def forward(self, input, sigma, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
@@ -135,10 +147,8 @@ class SelfAttention2d(ConditionedModule):
         qkv = self.qkv_proj(self.norm_in(input, cond))
         qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
         q, k, v = qkv.chunk(3, dim=1)
-        scale = k.shape[3] ** -0.25
-        att = ((q * scale) @ (k.transpose(2, 3) * scale)).softmax(3)
-        att = self.dropout(att)
-        y = (att @ v).transpose(2, 3).contiguous().view([n, c, h, w])
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p)
+        y = y.transpose(2, 3).contiguous().view([n, c, h, w])
         return input + self.out_proj(y)
 
 
@@ -164,13 +174,9 @@ class CrossAttention2d(ConditionedModule):
         kv = self.kv_proj(self.norm_enc(cond[self.cond_key]))
         kv = kv.view([n, -1, self.n_head * 2, c // self.n_head]).transpose(1, 2)
         k, v = kv.chunk(2, dim=1)
-        scale = k.shape[3] ** -0.25
-        att = ((q * scale) @ (k.transpose(2, 3) * scale))
-        att = att - (cond[self.cond_key_padding][:, None, None, :]) * 10000
-        att = att.softmax(3)
-        att = self.dropout(att)
-        y = (att @ v).transpose(2, 3)
-        y = y.contiguous().view([n, c, h, w])
+        attn_mask = (cond[self.cond_key_padding][:, None, None, :]) * -10000
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p=self.dropout.p)
+        y = y.transpose(2, 3).contiguous().view([n, c, h, w])
         return input + self.out_proj(y)
 
 
