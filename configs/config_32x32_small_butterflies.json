@@ -18,7 +18,7 @@
         "sigma_min": 1e-2,
         "sigma_max": 80,
         "sigma_sample_density": {
-            "type": "cosine"
+            "type": "cosine-interpolated"
         }
     },
     "dataset": {
@@ -34,7 +34,8 @@
         "weight_decay": 1e-3
     },
     "lr_sched": {
-        "type": "constant"
+        "type": "constant",
+        "warmup": 0.0
     },
     "ema_sched": {
         "type": "inverse",
